@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: erp-back
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:deploy
+    healthCheckPath: /v1/health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PANEL_URL
+        sync: false
+      - key: LICENSE_MODULES
+        value: DASHBOARD,AUDIT
+      - key: SEED_COMPANY_SLUG
+        sync: false
+      - key: SEED_COMPANY_NAME
+        sync: false
+      - key: SEED_MANAGER_EMAIL
+        sync: false
+      - key: SEED_MANAGER_PASSWORD
+        sync: false
