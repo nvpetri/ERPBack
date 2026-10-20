@@ -1,7 +1,104 @@
-import test from 'node:test';import assert from 'node:assert/strict';import {saleSchema,priceSale,hashPassword,verifyPassword,config} from '../src/core.mjs';
-const product={id:'11111111-1111-4111-8111-111111111111',name:'Pão',unit:'KG',price:1990,active:true,version:1};
-const sale=(quantity=250)=>saleSchema.parse({channel:'COUNTER',items:[{productId:product.id,quantity,expectedVersion:1}],discount:0,payments:[{method:'PIX',amount:498}]});
-test('weight and money use integer arithmetic with defined rounding',()=>{const result=priceSale(sale(),[product],'CASHIER');assert.equal(result.total,498);assert.equal(result.items[0].quantity,250);assert.throws(()=>priceSale(sale(),[{...product,unit:'UN'}],'MANAGER'),/inteira/);});
-test('server rejects stale price, duplicate item, discount abuse and payment mismatch',()=>{assert.throws(()=>priceSale(sale(),[{...product,version:2}],'MANAGER'),/alterado/);assert.throws(()=>priceSale({...sale(),items:[...sale().items,...sale().items]},[product],'MANAGER'),/Agrupe/);assert.throws(()=>priceSale({...sale(),discount:10},[product],'CASHIER'),/gerente/);assert.throws(()=>priceSale({...sale(),payments:[{method:'PIX',amount:1}]},[product],'MANAGER'),/recebimentos/);assert.throws(()=>priceSale({...sale(),payments:[{method:'CASH',amount:498,tendered:497}]},[product],'MANAGER'),/dinheiro/);});
-test('password hashes verify without storing the password',async()=>{const hashed=await hashPassword('unit-test-password-123');assert.ok(!hashed.includes('unit-test-password-123'));assert.equal(await verifyPassword('unit-test-password-123',hashed),true);assert.equal(await verifyPassword('wrong',hashed),false);});
-test('license and production origins fail closed',()=>{assert.throws(()=>config({DATABASE_URL:'postgres://u:p@localhost/test',LICENSE_MODULES:'DELIVERY'}));assert.throws(()=>config({NODE_ENV:'production',DATABASE_URL:'postgres://u:p@host/test?sslmode=verify-full',CORS_ORIGINS:'http://localhost:3000'}));});
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  saleSchema,
+  priceSale,
+  hashPassword,
+  verifyPassword,
+  config,
+} from "../src/core.mjs";
+const product = {
+  id: "11111111-1111-4111-8111-111111111111",
+  name: "Pão",
+  unit: "KG",
+  price: 1990,
+  active: true,
+  version: 1,
+};
+const sale = (quantity = 250) =>
+  saleSchema.parse({
+    channel: "COUNTER",
+    items: [{ productId: product.id, quantity, expectedVersion: 1 }],
+    discount: 0,
+    payments: [{ method: "PIX", amount: 498 }],
+  });
+test("weight and money use integer arithmetic with defined rounding", () => {
+  const result = priceSale(sale(), [product], "CASHIER");
+  assert.equal(result.total, 498);
+  assert.equal(result.items[0].quantity, 250);
+  assert.throws(
+    () => priceSale(sale(), [{ ...product, unit: "UN" }], "MANAGER"),
+    /inteira/,
+  );
+});
+test("server rejects stale price, duplicate item, discount abuse and payment mismatch", () => {
+  assert.throws(
+    () => priceSale(sale(), [{ ...product, version: 2 }], "MANAGER"),
+    /alterado/,
+  );
+  assert.throws(
+    () =>
+      priceSale(
+        { ...sale(), items: [...sale().items, ...sale().items] },
+        [product],
+        "MANAGER",
+      ),
+    /Agrupe/,
+  );
+  assert.throws(
+    () => priceSale({ ...sale(), discount: 10 }, [product], "CASHIER"),
+    /gerente/,
+  );
+  assert.throws(
+    () =>
+      priceSale(
+        { ...sale(), payments: [{ method: "PIX", amount: 1 }] },
+        [product],
+        "MANAGER",
+      ),
+    /recebimentos/,
+  );
+  assert.throws(
+    () =>
+      priceSale(
+        {
+          ...sale(),
+          payments: [{ method: "CASH", amount: 498, tendered: 497 }],
+        },
+        [product],
+        "MANAGER",
+      ),
+    /dinheiro/,
+  );
+});
+test("password hashes verify without storing the password", async () => {
+  const hashed = await hashPassword("unit-test-password-123");
+  assert.ok(!hashed.includes("unit-test-password-123"));
+  assert.equal(await verifyPassword("unit-test-password-123", hashed), true);
+  assert.equal(await verifyPassword("wrong", hashed), false);
+});
+test("license and production origins fail closed", () => {
+  assert.throws(() =>
+    config({
+      DATABASE_URL: "postgres://u:p@localhost/test",
+      LICENSE_MODULES: "DELIVERY",
+    }),
+  );
+  assert.throws(() =>
+    config({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://u:p@host/test?sslmode=verify-full",
+      CORS_ORIGINS: "http://localhost:3000",
+    }),
+  );
+});
+
+test("an explicitly empty license enables no optional modules", () => {
+  assert.deepEqual(
+    config({
+      DATABASE_URL: "postgres://u:p@localhost/test",
+      LICENSE_MODULES: "",
+    }).granted,
+    [],
+  );
+});

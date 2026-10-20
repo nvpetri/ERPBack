@@ -1,6 +1,47 @@
-import {randomUUID} from 'node:crypto';
-import {Database} from '../src/database.mjs';
-import {config,email,password,hashPassword} from '../src/core.mjs';
-const c=config(),db=new Database(c.database);
-try{const slug=process.env.SEED_COMPANY_SLUG||'minha-loja';if(!/^[a-z0-9-]{1,60}$/.test(slug))throw new Error();const managerEmail=email.parse(process.env.SEED_MANAGER_EMAIL);const managerPassword=password.parse(process.env.SEED_MANAGER_PASSWORD);const passwordHash=await hashPassword(managerPassword);
-await db.transaction(null,async tx=>{await tx.query('SELECT pg_advisory_xact_lock(7482532)');const {rows:[company]}=await tx.query('INSERT INTO company(id,slug,name,modules) VALUES($1,$2,$3,$4) ON CONFLICT(slug) DO UPDATE SET slug=excluded.slug RETURNING id',[randomUUID(),slug,process.env.SEED_COMPANY_NAME||'Minha loja',c.granted]);await tx.query('INSERT INTO app_user(id,company_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(company_id,email) DO NOTHING',[randomUUID(),company.id,'Administrador',managerEmail,passwordHash,'MANAGER']);});console.log('Loja e gerente preparados. Dados e senhas existentes preservados.');}catch{console.error('Seed recusado. Confira SEED_COMPANY_SLUG, SEED_MANAGER_EMAIL e SEED_MANAGER_PASSWORD (12–128 caracteres).');process.exitCode=1;}finally{await db.close();}
+import { randomUUID } from "node:crypto";
+import { Database } from "../src/database.mjs";
+import { config, email, password, hashPassword } from "../src/core.mjs";
+const c = config(),
+  db = new Database(c.database);
+try {
+  const slug = process.env.SEED_COMPANY_SLUG || "minha-loja";
+  if (!/^[a-z0-9-]{1,60}$/.test(slug)) throw new Error();
+  const managerEmail = email.parse(process.env.SEED_MANAGER_EMAIL);
+  const managerPassword = password.parse(process.env.SEED_MANAGER_PASSWORD);
+  const passwordHash = await hashPassword(managerPassword);
+  await db.transaction(null, async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(7482532)");
+    const {
+      rows: [company],
+    } = await tx.query(
+      "INSERT INTO company(id,slug,name,modules) VALUES($1,$2,$3,$4) ON CONFLICT(slug) DO UPDATE SET slug=excluded.slug RETURNING id",
+      [
+        randomUUID(),
+        slug,
+        process.env.SEED_COMPANY_NAME || "Minha loja",
+        c.granted,
+      ],
+    );
+    await tx.query(
+      "INSERT INTO app_user(id,company_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(company_id,email) DO NOTHING",
+      [
+        randomUUID(),
+        company.id,
+        "Administrador",
+        managerEmail,
+        passwordHash,
+        "MANAGER",
+      ],
+    );
+  });
+  console.log(
+    "Loja e gerente preparados. Dados e senhas existentes preservados.",
+  );
+} catch {
+  console.error(
+    "Seed recusado. Confira SEED_COMPANY_SLUG, SEED_MANAGER_EMAIL e SEED_MANAGER_PASSWORD (12–128 caracteres).",
+  );
+  process.exitCode = 1;
+} finally {
+  await db.close();
+}

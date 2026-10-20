@@ -1,32 +1,795 @@
-import {randomUUID} from 'node:crypto';
-import sharp from 'sharp';
-import {z} from 'zod';
-import {ensure,RuleError,hash,secret,hashPassword,verifyPassword,dummyHash,id,email,password,productSchema,saleSchema,priceSale,userDto} from './core.mjs';
+import { randomUUID } from "node:crypto";
+import sharp from "sharp";
+import { z } from "zod";
+import {
+  ensure,
+  RuleError,
+  hash,
+  secret,
+  hashPassword,
+  verifyPassword,
+  dummyHash,
+  id,
+  email,
+  password,
+  productSchema,
+  saleSchema,
+  priceSale,
+  userDto,
+} from "./core.mjs";
 export class Service {
- constructor(db,config,mail){this.db=db;this.config=config;this.mail=mail||this.sendMail.bind(this);}
- async sendMail(to,url,purpose){ensure(this.config.emailKey&&this.config.panel,'EMAIL_NOT_CONFIGURED','Configure EMAIL_API_KEY, EMAIL_FROM e PANEL_URL para enviar links.',503);const result=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:'Bearer '+this.config.emailKey,'Content-Type':'application/json'},body:JSON.stringify({from:this.config.emailFrom,to:[to],subject:purpose==='RESET'?'Redefinir acesso ao sistema':'Complete seu acesso ao sistema',text:`Acesse o link para ${purpose==='RESET'?'definir sua nova senha':'completar seu cadastro'}: ${url}\nO link é individual, de uso único e expira em ${purpose==='RESET'?'30 minutos':'24 horas'}. Se não solicitou, ignore.`}),signal:AbortSignal.timeout(10000)});ensure(result.ok,'EMAIL_FAILED','Envio indisponível. O gerente pode reenviar o convite.',503);}
- async company(slug){const {rows:[c]}=await this.db.query('SELECT id,slug,name,sector,primary_color,accent_color,logo_version,channels,modules,version FROM company WHERE slug=$1',[slug]);ensure(c,'NOT_FOUND','Estabelecimento não encontrado.',404);return c;}
- capabilities(company){return {granted:this.config.granted,enabled:company.modules.filter(m=>this.config.granted.includes(m))};}
- async me(actor){const {rows:[u]}=await this.db.query('SELECT * FROM app_user WHERE id=$1 AND company_id=$2',[actor.id,actor.company_id]);const {rows:[company]}=await this.db.query('SELECT id,slug,name,sector,primary_color,accent_color,logo_version,channels,modules,version FROM company WHERE id=$1',[actor.company_id]);return {user:userDto(u),company,capabilities:this.capabilities(company)};}
- async authenticate(token,requestId){ensure(typeof token==='string'&&/^[A-Za-z0-9_-]{43}$/.test(token),'UNAUTHENTICATED','Entre para continuar.',401);const {rows:[u]}=await this.db.query('SELECT u.*,s.id session_id FROM session s JOIN app_user u ON u.id=s.user_id AND u.company_id=s.company_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.enabled AND u.password_hash IS NOT NULL',[hash(token)]);ensure(u,'SESSION_EXPIRED','Sessão expirada ou revogada.',401);return {id:u.id,company_id:u.company_id,name:u.name,role:u.role,shared_account:u.shared_account,session_id:u.session_id,request_id:requestId};}
- manager(actor){ensure(actor.role==='MANAGER','FORBIDDEN','Operação disponível somente ao gerente.',403);}
- async module(actor,name){this.manager(actor);const {rows:[c]}=await this.db.query('SELECT modules FROM company WHERE id=$1',[actor.company_id]);ensure(this.config.granted.includes(name)&&c.modules.includes(name),'MODULE_DISABLED','Módulo não habilitado para este estabelecimento.',403);}
- async login(raw){const input=z.strictObject({slug:z.string().regex(/^[a-z0-9-]{1,60}$/),email,password:z.string().min(1).max(128)}).parse(raw);await this.db.rate('login:'+input.slug+':'+input.email);const {rows:[u]}=await this.db.query('SELECT u.* FROM app_user u JOIN company c ON c.id=u.company_id WHERE c.slug=$1 AND u.email=$2',[input.slug,input.email]);const valid=await verifyPassword(input.password,u?.password_hash||dummyHash);ensure(u?.enabled&&u.password_hash&&valid,'INVALID_CREDENTIALS','E-mail ou senha inválidos.',401);const token=secret(),expiresAt=new Date(Date.now()+12*3600000).toISOString();await this.db.transaction({...u,request_id:randomUUID()},async tx=>{const {rows:[current]}=await tx.query('SELECT enabled,password_hash FROM app_user WHERE id=$1 AND company_id=$2',[u.id,u.company_id]);ensure(current?.enabled&&current.password_hash===u.password_hash,'INVALID_CREDENTIALS','E-mail ou senha inválidos.',401);await tx.query('INSERT INTO session(id,company_id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)',[randomUUID(),u.company_id,u.id,hash(token),expiresAt]);});return {accessToken:token,expiresAt};}
- async settings(actor,raw){this.manager(actor);const input=z.strictObject({name:z.string().trim().min(1).max(100),sector:z.enum(['RETAIL','BAKERY','RESTAURANT','OTHER']),primary_color:z.string().regex(/^#[0-9A-Fa-f]{6}$/),accent_color:z.string().regex(/^#[0-9A-Fa-f]{6}$/),channels:z.array(z.enum(['COUNTER','PICKUP','TABLE'])).min(1).max(3),modules:z.array(z.enum(['DASHBOARD','AUDIT'])).max(2),expectedVersion:z.number().int().positive()}).parse(raw);ensure(input.modules.every(m=>this.config.granted.includes(m)),'MODULE_NOT_LICENSED','Um dos módulos não faz parte dos recursos liberados.',403);return this.db.transaction(actor,async tx=>{const {rows:[c]}=await tx.query('UPDATE company SET name=$1,sector=$2,primary_color=$3,accent_color=$4,channels=$5,modules=$6,version=version+1 WHERE id=$7 AND version=$8 RETURNING version',[input.name,input.sector,input.primary_color,input.accent_color,[...new Set(input.channels)],[...new Set(input.modules)],actor.company_id,input.expectedVersion]);ensure(c,'VERSION_CONFLICT','As configurações foram alteradas. Atualize a tela.',409);return c;});}
- async logo(actor,raw){this.manager(actor);const input=z.strictObject({base64:z.string().max(700000).nullable(),expectedVersion:z.number().int().positive()}).parse(raw);let bytes=null;if(input.base64){ensure(/^[A-Za-z0-9+/]+={0,2}$/.test(input.base64),'INVALID_IMAGE','Imagem inválida.');const original=Buffer.from(input.base64,'base64');try{const image=sharp(original,{limitInputPixels:16000000});const meta=await image.metadata();ensure(['png','jpeg','webp'].includes(meta.format),'INVALID_IMAGE','Use PNG, JPEG ou WebP.');bytes=await image.rotate().resize(320,320,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toBuffer();}catch{throw new RuleError('INVALID_IMAGE','Use imagem PNG, JPEG ou WebP de até 500 KB.');}}
- return this.db.transaction(actor,async tx=>{const {rows:[c]}=await tx.query('UPDATE company SET logo=$1,logo_version=logo_version+1,version=version+1 WHERE id=$2 AND version=$3 RETURNING version,logo_version',[bytes,actor.company_id,input.expectedVersion]);ensure(c,'VERSION_CONFLICT','As configurações foram alteradas. Atualize a tela.',409);return c;});}
- async products(actor){const {rows}=await this.db.query('SELECT id,sku,name,category,unit,price,active,version FROM product WHERE company_id=$1 ORDER BY name,id LIMIT 2001',[actor.company_id]);ensure(rows.length<=2000,'CATALOG_LIMIT','Catálogo acima do limite desta versão.',409);return {items:rows};}
- async product(actor,raw,productId){this.manager(actor);let version;if(productId){id.parse(productId);const parsed=z.strictObject({...productSchema.shape,expectedVersion:z.number().int().positive()}).parse(raw);version=parsed.expectedVersion;delete parsed.expectedVersion;raw=parsed;}const p=productSchema.parse(raw);return this.db.transaction(actor,async tx=>{if(!productId){const {rows:[n]}=await tx.query('SELECT count(*)::int count FROM product WHERE company_id=$1',[actor.company_id]);ensure(n.count<2000,'CATALOG_LIMIT','Limite de 2.000 produtos nesta versão.',409);productId=randomUUID();await tx.query('INSERT INTO product(id,company_id,sku,name,category,unit,price,active) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[productId,actor.company_id,p.sku,p.name,p.category,p.unit,p.price,p.active]);return {id:productId};}const {rows:[updated]}=await tx.query('UPDATE product SET sku=$1,name=$2,category=$3,unit=$4,price=$5,active=$6,version=version+1 WHERE company_id=$7 AND id=$8 AND version=$9 RETURNING id',[p.sku,p.name,p.category,p.unit,p.price,p.active,actor.company_id,productId,version]);ensure(updated,'VERSION_CONFLICT','Produto não encontrado ou alterado. Atualize o catálogo.',409);return updated;});}
- async createSale(actor,key,raw){id.parse(key);const input=saleSchema.parse(raw);return this.db.write(actor,key,{operation:'sale.create',...input},async tx=>{const {rows:[company]}=await tx.query('SELECT channels FROM company WHERE id=$1',[actor.company_id]);ensure(company.channels.includes(input.channel),'CHANNEL_DISABLED','Frente de atendimento desativada.',403);const {rows:products}=await tx.query('SELECT * FROM product WHERE company_id=$1 AND id=ANY($2::uuid[]) FOR SHARE',[actor.company_id,input.items.map(i=>i.productId)]);const priced=priceSale(input,products,actor.role),saleId=randomUUID();const {rows:[sale]}=await tx.query('INSERT INTO sale(id,company_id,actor_id,channel,subtotal,discount,total) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,number,total,status,version,created_at',[saleId,actor.company_id,actor.id,input.channel,priced.subtotal,priced.discount,priced.total]);for(const item of priced.items)await tx.query('INSERT INTO sale_item(id,company_id,sale_id,product_id,sku,name,unit,quantity,price,total) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[randomUUID(),actor.company_id,saleId,item.id,item.sku,item.name,item.unit,item.quantity,item.price,item.total]);for(const p of input.payments)await tx.query('INSERT INTO payment(id,company_id,sale_id,method,amount,tendered) VALUES($1,$2,$3,$4,$5,$6)',[randomUUID(),actor.company_id,saleId,p.method,p.amount,p.tendered??null]);return sale;});}
- period(query){return z.strictObject({from:z.iso.datetime(),to:z.iso.datetime()}).refine(v=>Date.parse(v.to)>Date.parse(v.from)&&Date.parse(v.to)-Date.parse(v.from)<=93*86400000,'Escolha um período de até 93 dias.').parse({from:query.from,to:query.to});}
- async sales(actor,query){const period=this.period(query);const cursor=query.cursor?id.parse(query.cursor):null;const {rows}=await this.db.query('SELECT id,number,channel,status,total,created_at,version FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND ($4::uuid IS NULL OR (created_at,id)<(SELECT created_at,id FROM sale WHERE company_id=$1 AND id=$4)) ORDER BY created_at DESC,id DESC LIMIT 51',[actor.company_id,period.from,period.to,cursor]);return {items:rows.slice(0,50),nextCursor:rows.length>50?rows[49].id:null};}
- async sale(actor,saleId){id.parse(saleId);const {rows:[sale]}=await this.db.query('SELECT s.*,u.name actor_name FROM sale s JOIN app_user u ON u.id=s.actor_id AND u.company_id=s.company_id WHERE s.company_id=$1 AND s.id=$2',[actor.company_id,saleId]);ensure(sale,'NOT_FOUND','Venda não encontrada.',404);const {rows:items}=await this.db.query('SELECT sku,name,unit,quantity,price,total FROM sale_item WHERE company_id=$1 AND sale_id=$2 ORDER BY name',[actor.company_id,saleId]);const {rows:payments}=await this.db.query('SELECT method,amount,tendered FROM payment WHERE company_id=$1 AND sale_id=$2',[actor.company_id,saleId]);return {...sale,items,payments};}
- async cancel(actor,key,saleId,raw){this.manager(actor);id.parse(key);id.parse(saleId);const input=z.strictObject({expectedVersion:z.number().int().positive(),reason:z.string().trim().min(5).max(240)}).parse(raw);return this.db.write(actor,key,{operation:'sale.cancel',saleId,...input},async tx=>{const {rows:[sale]}=await tx.query("UPDATE sale SET status='CANCELLED',cancelled_at=now(),cancelled_reason=$1,version=version+1 WHERE company_id=$2 AND id=$3 AND version=$4 AND status='COMPLETED' RETURNING id,status,version",[input.reason,actor.company_id,saleId,input.expectedVersion]);ensure(sale,'VERSION_CONFLICT','Venda já cancelada, alterada ou não encontrada.',409);return sale;});}
- async dashboard(actor,query){await this.module(actor,'DASHBOARD');const p=this.period(query);const args=[actor.company_id,p.from,p.to];const {rows:[summary]}=await this.db.query(`SELECT count(*) FILTER(WHERE status='COMPLETED')::int sales,COALESCE(sum(total) FILTER(WHERE status='COMPLETED'),0)::text revenue,COALESCE(sum(discount) FILTER(WHERE status='COMPLETED'),0)::text discounts,count(*) FILTER(WHERE status='CANCELLED')::int cancelled FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3`,args);const {rows:channels}=await this.db.query(`SELECT channel,count(*)::int sales,sum(total)::text revenue FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND status='COMPLETED' GROUP BY channel ORDER BY sum(total) DESC`,args);const {rows:products}=await this.db.query(`SELECT i.name,i.unit,sum(i.quantity)::text quantity,sum(i.total)::text revenue FROM sale_item i JOIN sale s ON s.id=i.sale_id AND s.company_id=i.company_id WHERE s.company_id=$1 AND s.created_at>=$2 AND s.created_at<$3 AND s.status='COMPLETED' GROUP BY i.name,i.unit ORDER BY sum(i.total) DESC LIMIT 10`,args);return {summary,channels,products};}
- async audit(actor,query){await this.module(actor,'AUDIT');const p=this.period(query);const cursor=query.cursor?z.string().regex(/^[1-9]\d{0,18}$/).parse(query.cursor):null;const table=query.table?z.enum(['company','app_user','product','sale','sale_item','payment','invitation']).parse(query.table):null;const {rows}=await this.db.query('SELECT * FROM audit WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND ($4::bigint IS NULL OR id<$4) AND ($5::text IS NULL OR table_name=$5) ORDER BY id DESC LIMIT 51',[actor.company_id,p.from,p.to,cursor,table]);return {items:rows.slice(0,50),nextCursor:rows.length>50?rows[49].id:null};}
- async users(actor){this.manager(actor);const {rows}=await this.db.query('SELECT * FROM app_user WHERE company_id=$1 ORDER BY name LIMIT 100',[actor.company_id]);return {items:rows.map(userDto)};}
- async invite(actor,raw,userId){this.manager(actor);ensure(this.config.emailKey&&this.config.panel,'EMAIL_NOT_CONFIGURED','Configure o envio de e-mails antes de convidar funcionários.',503);await this.db.rate('invite:'+actor.company_id,30,3600);const token=secret(),tokenHash=hash(token);const input=userId?null:z.strictObject({name:z.string().trim().min(1).max(80),email,role:z.enum(['MANAGER','CASHIER']),shared_account:z.boolean().default(false)}).parse(raw);if(userId)id.parse(userId);const result=await this.db.transaction(actor,async tx=>{let user;if(!userId){const {rows:[n]}=await tx.query('SELECT count(*)::int count FROM app_user WHERE company_id=$1',[actor.company_id]);ensure(n.count<100,'STAFF_LIMIT','Limite de 100 funcionários.',409);const {rows:[u]}=await tx.query('INSERT INTO app_user(id,company_id,name,email,role,shared_account) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',[randomUUID(),actor.company_id,input.name,input.email,input.role,input.shared_account]);user=u;}else{const {rows:[u]}=await tx.query('SELECT * FROM app_user WHERE id=$1 AND company_id=$2',[userId,actor.company_id]);ensure(u?.enabled&&!u.password_hash,'INVITE_UNAVAILABLE','Convite disponível somente para cadastro pendente e ativo.',409);user=u;}await tx.query('UPDATE invitation SET consumed_at=now() WHERE company_id=$1 AND user_id=$2 AND consumed_at IS NULL',[actor.company_id,user.id]);await tx.query("INSERT INTO invitation(id,company_id,user_id,token_hash,purpose,expires_at) VALUES($1,$2,$3,$4,'INVITE',now()+interval '24 hours')",[randomUUID(),actor.company_id,user.id,tokenHash]);return {id:user.id,email:user.email};});try{await this.mail(result.email,this.config.panel+'/acesso#'+token,'INVITE');return {id:result.id,emailSent:true};}catch{return {id:result.id,emailSent:false,message:'Cadastro pendente criado. Falha no envio; use Reenviar convite.'};}}
- async user(actor,userId,raw){this.manager(actor);id.parse(userId);const input=z.strictObject({enabled:z.boolean(),expectedVersion:z.number().int().positive()}).parse(raw);ensure(userId!==actor.id,'SELF_DISABLE','Você não pode desativar seu próprio acesso.');return this.db.transaction(actor,async tx=>{const {rows:[u]}=await tx.query('UPDATE app_user SET enabled=$1,version=version+1 WHERE company_id=$2 AND id=$3 AND version=$4 RETURNING id',[input.enabled,actor.company_id,userId,input.expectedVersion]);ensure(u,'VERSION_CONFLICT','Funcionário alterado ou não encontrado.',409);await tx.query('DELETE FROM session WHERE company_id=$1 AND user_id=$2',[actor.company_id,userId]);return u;});}
- async requestReset(raw){const input=z.strictObject({slug:z.string().max(60),email}).parse(raw);ensure(this.config.emailKey&&this.config.panel,'EMAIL_NOT_CONFIGURED','Redefinição por e-mail indisponível. Procure o responsável pelo sistema.',503);await this.db.rate('reset:'+input.slug+':'+input.email,3,3600);const {rows:[u]}=await this.db.query('SELECT u.* FROM app_user u JOIN company c ON c.id=u.company_id WHERE c.slug=$1 AND u.email=$2 AND u.enabled AND u.password_hash IS NOT NULL',[input.slug,input.email]);if(u){const token=secret();await this.db.transaction(u,async tx=>{await tx.query("UPDATE invitation SET consumed_at=now() WHERE user_id=$1 AND company_id=$2 AND purpose='RESET' AND consumed_at IS NULL",[u.id,u.company_id]);await tx.query("INSERT INTO invitation(id,company_id,user_id,token_hash,purpose,expires_at) VALUES($1,$2,$3,$4,'RESET',now()+interval '30 minutes')",[randomUUID(),u.company_id,u.id,hash(token)]);});await this.mail(u.email,this.config.panel+'/acesso#'+token,'RESET').catch(()=>{});}return {accepted:true};}
- async complete(raw){const input=z.strictObject({token:z.string().regex(/^[A-Za-z0-9_-]{43}$/),password,name:z.string().trim().min(1).max(80).optional()}).parse(raw);const {rows:[link]}=await this.db.query('SELECT i.*,u.name,u.enabled,u.role,u.shared_account FROM invitation i JOIN app_user u ON u.id=i.user_id AND u.company_id=i.company_id WHERE token_hash=$1',[hash(input.token)]);ensure(link?.enabled&&link.expires_at>new Date()&&!link.consumed_at,'INVALID_LINK','Link inválido ou expirado.');const passwordHash=await hashPassword(input.password);return this.db.transaction({company_id:link.company_id,id:link.user_id,name:link.name,role:link.role,shared_account:link.shared_account},async tx=>{const {rows:[current]}=await tx.query('SELECT i.*,u.enabled FROM invitation i JOIN app_user u ON u.id=i.user_id AND u.company_id=i.company_id WHERE i.id=$1 AND i.consumed_at IS NULL AND i.expires_at>now() FOR UPDATE',[link.id]);ensure(current?.enabled,'INVALID_LINK','Link inválido ou expirado.');await tx.query('UPDATE app_user SET password_hash=$1,name=COALESCE($2,name),version=version+1 WHERE id=$3 AND company_id=$4',[passwordHash,input.name,link.user_id,link.company_id]);await tx.query('UPDATE invitation SET consumed_at=now() WHERE user_id=$1 AND company_id=$2 AND consumed_at IS NULL',[link.user_id,link.company_id]);await tx.query('DELETE FROM session WHERE user_id=$1 AND company_id=$2',[link.user_id,link.company_id]);return {completed:true};});}
+  constructor(db, config, mail) {
+    this.db = db;
+    this.config = config;
+    this.mail = mail || this.sendMail.bind(this);
+  }
+  async sendMail(to, url, purpose) {
+    ensure(
+      this.config.emailKey && this.config.panel,
+      "EMAIL_NOT_CONFIGURED",
+      "Configure EMAIL_API_KEY, EMAIL_FROM e PANEL_URL para enviar links.",
+      503,
+    );
+    const result = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + this.config.emailKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: this.config.emailFrom,
+        to: [to],
+        subject:
+          purpose === "RESET"
+            ? "Redefinir acesso ao sistema"
+            : "Complete seu acesso ao sistema",
+        text: `Acesse o link para ${purpose === "RESET" ? "definir sua nova senha" : "completar seu cadastro"}: ${url}\nO link é individual, de uso único e expira em ${purpose === "RESET" ? "30 minutos" : "24 horas"}. Se não solicitou, ignore.`,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    ensure(
+      result.ok,
+      "EMAIL_FAILED",
+      "Envio indisponível. O gerente pode reenviar o convite.",
+      503,
+    );
+  }
+  async company(slug) {
+    const {
+      rows: [c],
+    } = await this.db.query(
+      "SELECT id,slug,name,sector,primary_color,accent_color,logo_version,channels,modules,version FROM company WHERE slug=$1",
+      [slug],
+    );
+    ensure(c, "NOT_FOUND", "Estabelecimento não encontrado.", 404);
+    return c;
+  }
+  capabilities(company) {
+    return {
+      granted: this.config.granted,
+      enabled: company.modules.filter((m) => this.config.granted.includes(m)),
+    };
+  }
+  async me(actor) {
+    const {
+      rows: [u],
+    } = await this.db.query(
+      "SELECT * FROM app_user WHERE id=$1 AND company_id=$2",
+      [actor.id, actor.company_id],
+    );
+    const {
+      rows: [company],
+    } = await this.db.query(
+      "SELECT id,slug,name,sector,primary_color,accent_color,logo_version,channels,modules,version FROM company WHERE id=$1",
+      [actor.company_id],
+    );
+    company.modules = company.modules.filter((module) =>
+      this.config.granted.includes(module),
+    );
+    return {
+      user: userDto(u),
+      company,
+      capabilities: this.capabilities(company),
+    };
+  }
+  async authenticate(token, requestId) {
+    ensure(
+      typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token),
+      "UNAUTHENTICATED",
+      "Entre para continuar.",
+      401,
+    );
+    const {
+      rows: [u],
+    } = await this.db.query(
+      "SELECT u.*,s.id session_id FROM session s JOIN app_user u ON u.id=s.user_id AND u.company_id=s.company_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.enabled AND u.password_hash IS NOT NULL",
+      [hash(token)],
+    );
+    ensure(u, "SESSION_EXPIRED", "Sessão expirada ou revogada.", 401);
+    return {
+      id: u.id,
+      company_id: u.company_id,
+      name: u.name,
+      role: u.role,
+      shared_account: u.shared_account,
+      session_id: u.session_id,
+      request_id: requestId,
+    };
+  }
+  manager(actor) {
+    ensure(
+      actor.role === "MANAGER",
+      "FORBIDDEN",
+      "Operação disponível somente ao gerente.",
+      403,
+    );
+  }
+  async module(actor, name) {
+    this.manager(actor);
+    const {
+      rows: [c],
+    } = await this.db.query("SELECT modules FROM company WHERE id=$1", [
+      actor.company_id,
+    ]);
+    ensure(
+      this.config.granted.includes(name) && c.modules.includes(name),
+      "MODULE_DISABLED",
+      "Módulo não habilitado para este estabelecimento.",
+      403,
+    );
+  }
+  async login(raw) {
+    const input = z
+      .strictObject({
+        slug: z.string().regex(/^[a-z0-9-]{1,60}$/),
+        email,
+        password: z.string().min(1).max(128),
+      })
+      .parse(raw);
+    await this.db.rate("login:" + input.slug + ":" + input.email);
+    const {
+      rows: [u],
+    } = await this.db.query(
+      "SELECT u.* FROM app_user u JOIN company c ON c.id=u.company_id WHERE c.slug=$1 AND u.email=$2",
+      [input.slug, input.email],
+    );
+    const valid = await verifyPassword(
+      input.password,
+      u?.password_hash || dummyHash,
+    );
+    ensure(
+      u?.enabled && u.password_hash && valid,
+      "INVALID_CREDENTIALS",
+      "E-mail ou senha inválidos.",
+      401,
+    );
+    const token = secret(),
+      expiresAt = new Date(Date.now() + 12 * 3600000).toISOString();
+    await this.db.transaction(
+      { ...u, request_id: randomUUID() },
+      async (tx) => {
+        const {
+          rows: [current],
+        } = await tx.query(
+          "SELECT enabled,password_hash FROM app_user WHERE id=$1 AND company_id=$2",
+          [u.id, u.company_id],
+        );
+        ensure(
+          current?.enabled && current.password_hash === u.password_hash,
+          "INVALID_CREDENTIALS",
+          "E-mail ou senha inválidos.",
+          401,
+        );
+        await tx.query(
+          "INSERT INTO session(id,company_id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4,$5)",
+          [randomUUID(), u.company_id, u.id, hash(token), expiresAt],
+        );
+      },
+    );
+    return { accessToken: token, expiresAt };
+  }
+  async settings(actor, raw) {
+    this.manager(actor);
+    const input = z
+      .strictObject({
+        name: z.string().trim().min(1).max(100),
+        sector: z.enum(["RETAIL", "BAKERY", "RESTAURANT", "OTHER"]),
+        primary_color: z.string().regex(/^#[0-9A-Fa-f]{6}$/),
+        accent_color: z.string().regex(/^#[0-9A-Fa-f]{6}$/),
+        channels: z
+          .array(z.enum(["COUNTER", "PICKUP", "TABLE"]))
+          .min(1)
+          .max(3),
+        modules: z.array(z.enum(["DASHBOARD", "AUDIT"])).max(2),
+        expectedVersion: z.number().int().positive(),
+      })
+      .parse(raw);
+    ensure(
+      input.modules.every((m) => this.config.granted.includes(m)),
+      "MODULE_NOT_LICENSED",
+      "Um dos módulos não faz parte dos recursos liberados.",
+      403,
+    );
+    return this.db.transaction(actor, async (tx) => {
+      const {
+        rows: [c],
+      } = await tx.query(
+        "UPDATE company SET name=$1,sector=$2,primary_color=$3,accent_color=$4,channels=$5,modules=$6,version=version+1 WHERE id=$7 AND version=$8 RETURNING version",
+        [
+          input.name,
+          input.sector,
+          input.primary_color,
+          input.accent_color,
+          [...new Set(input.channels)],
+          [...new Set(input.modules)],
+          actor.company_id,
+          input.expectedVersion,
+        ],
+      );
+      ensure(
+        c,
+        "VERSION_CONFLICT",
+        "As configurações foram alteradas. Atualize a tela.",
+        409,
+      );
+      return c;
+    });
+  }
+  async logo(actor, raw) {
+    this.manager(actor);
+    const input = z
+      .strictObject({
+        base64: z.string().max(700000).nullable(),
+        expectedVersion: z.number().int().positive(),
+      })
+      .parse(raw);
+    let bytes = null;
+    if (input.base64) {
+      ensure(
+        /^[A-Za-z0-9+/]+={0,2}$/.test(input.base64),
+        "INVALID_IMAGE",
+        "Imagem inválida.",
+      );
+      const original = Buffer.from(input.base64, "base64");
+      try {
+        const image = sharp(original, { limitInputPixels: 16000000 });
+        const meta = await image.metadata();
+        ensure(
+          ["png", "jpeg", "webp"].includes(meta.format),
+          "INVALID_IMAGE",
+          "Use PNG, JPEG ou WebP.",
+        );
+        bytes = await image
+          .rotate()
+          .resize(320, 320, { fit: "inside", withoutEnlargement: true })
+          .webp({ quality: 85 })
+          .toBuffer();
+      } catch {
+        throw new RuleError(
+          "INVALID_IMAGE",
+          "Use imagem PNG, JPEG ou WebP de até 500 KB.",
+        );
+      }
+    }
+    return this.db.transaction(actor, async (tx) => {
+      const {
+        rows: [c],
+      } = await tx.query(
+        "UPDATE company SET logo=$1,logo_version=logo_version+1,version=version+1 WHERE id=$2 AND version=$3 RETURNING version,logo_version",
+        [bytes, actor.company_id, input.expectedVersion],
+      );
+      ensure(
+        c,
+        "VERSION_CONFLICT",
+        "As configurações foram alteradas. Atualize a tela.",
+        409,
+      );
+      return c;
+    });
+  }
+  async products(actor) {
+    const { rows } = await this.db.query(
+      "SELECT id,sku,name,category,unit,price,active,version FROM product WHERE company_id=$1 ORDER BY name,id LIMIT 2001",
+      [actor.company_id],
+    );
+    ensure(
+      rows.length <= 2000,
+      "CATALOG_LIMIT",
+      "Catálogo acima do limite desta versão.",
+      409,
+    );
+    return { items: rows };
+  }
+  async product(actor, raw, productId) {
+    this.manager(actor);
+    let version;
+    if (productId) {
+      id.parse(productId);
+      const parsed = z
+        .strictObject({
+          ...productSchema.shape,
+          expectedVersion: z.number().int().positive(),
+        })
+        .parse(raw);
+      version = parsed.expectedVersion;
+      delete parsed.expectedVersion;
+      raw = parsed;
+    }
+    const p = productSchema.parse(raw);
+    return this.db.transaction(actor, async (tx) => {
+      if (!productId) {
+        const {
+          rows: [n],
+        } = await tx.query(
+          "SELECT count(*)::int count FROM product WHERE company_id=$1",
+          [actor.company_id],
+        );
+        ensure(
+          n.count < 2000,
+          "CATALOG_LIMIT",
+          "Limite de 2.000 produtos nesta versão.",
+          409,
+        );
+        productId = randomUUID();
+        await tx.query(
+          "INSERT INTO product(id,company_id,sku,name,category,unit,price,active) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+          [
+            productId,
+            actor.company_id,
+            p.sku,
+            p.name,
+            p.category,
+            p.unit,
+            p.price,
+            p.active,
+          ],
+        );
+        return { id: productId };
+      }
+      const {
+        rows: [updated],
+      } = await tx.query(
+        "UPDATE product SET sku=$1,name=$2,category=$3,unit=$4,price=$5,active=$6,version=version+1 WHERE company_id=$7 AND id=$8 AND version=$9 RETURNING id",
+        [
+          p.sku,
+          p.name,
+          p.category,
+          p.unit,
+          p.price,
+          p.active,
+          actor.company_id,
+          productId,
+          version,
+        ],
+      );
+      ensure(
+        updated,
+        "VERSION_CONFLICT",
+        "Produto não encontrado ou alterado. Atualize o catálogo.",
+        409,
+      );
+      return updated;
+    });
+  }
+  async createSale(actor, key, raw) {
+    id.parse(key);
+    const input = saleSchema.parse(raw);
+    return this.db.write(
+      actor,
+      key,
+      { operation: "sale.create", ...input },
+      async (tx) => {
+        const {
+          rows: [company],
+        } = await tx.query("SELECT channels FROM company WHERE id=$1", [
+          actor.company_id,
+        ]);
+        ensure(
+          company.channels.includes(input.channel),
+          "CHANNEL_DISABLED",
+          "Frente de atendimento desativada.",
+          403,
+        );
+        const { rows: products } = await tx.query(
+          "SELECT * FROM product WHERE company_id=$1 AND id=ANY($2::uuid[]) FOR SHARE",
+          [actor.company_id, input.items.map((i) => i.productId)],
+        );
+        const priced = priceSale(input, products, actor.role),
+          saleId = randomUUID();
+        const {
+          rows: [sale],
+        } = await tx.query(
+          "INSERT INTO sale(id,company_id,actor_id,channel,subtotal,discount,total) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,number,total,status,version,created_at",
+          [
+            saleId,
+            actor.company_id,
+            actor.id,
+            input.channel,
+            priced.subtotal,
+            priced.discount,
+            priced.total,
+          ],
+        );
+        for (const item of priced.items)
+          await tx.query(
+            "INSERT INTO sale_item(id,company_id,sale_id,product_id,sku,name,unit,quantity,price,total) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            [
+              randomUUID(),
+              actor.company_id,
+              saleId,
+              item.id,
+              item.sku,
+              item.name,
+              item.unit,
+              item.quantity,
+              item.price,
+              item.total,
+            ],
+          );
+        for (const p of input.payments)
+          await tx.query(
+            "INSERT INTO payment(id,company_id,sale_id,method,amount,tendered) VALUES($1,$2,$3,$4,$5,$6)",
+            [
+              randomUUID(),
+              actor.company_id,
+              saleId,
+              p.method,
+              p.amount,
+              p.tendered ?? null,
+            ],
+          );
+        return sale;
+      },
+    );
+  }
+  period(query) {
+    return z
+      .strictObject({ from: z.iso.datetime(), to: z.iso.datetime() })
+      .refine(
+        (v) =>
+          Date.parse(v.to) > Date.parse(v.from) &&
+          Date.parse(v.to) - Date.parse(v.from) <= 93 * 86400000,
+        "Escolha um período de até 93 dias.",
+      )
+      .parse({ from: query.from, to: query.to });
+  }
+  async sales(actor, query) {
+    const period = this.period(query);
+    const cursor = query.cursor ? id.parse(query.cursor) : null;
+    const { rows } = await this.db.query(
+      "SELECT id,number,channel,status,total,created_at,version FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND ($4::uuid IS NULL OR (created_at,id)<(SELECT created_at,id FROM sale WHERE company_id=$1 AND id=$4)) ORDER BY created_at DESC,id DESC LIMIT 51",
+      [actor.company_id, period.from, period.to, cursor],
+    );
+    return {
+      items: rows.slice(0, 50),
+      nextCursor: rows.length > 50 ? rows[49].id : null,
+    };
+  }
+  async sale(actor, saleId) {
+    id.parse(saleId);
+    const {
+      rows: [sale],
+    } = await this.db.query(
+      "SELECT s.*,u.name actor_name FROM sale s JOIN app_user u ON u.id=s.actor_id AND u.company_id=s.company_id WHERE s.company_id=$1 AND s.id=$2",
+      [actor.company_id, saleId],
+    );
+    ensure(sale, "NOT_FOUND", "Venda não encontrada.", 404);
+    const { rows: items } = await this.db.query(
+      "SELECT sku,name,unit,quantity,price,total FROM sale_item WHERE company_id=$1 AND sale_id=$2 ORDER BY name",
+      [actor.company_id, saleId],
+    );
+    const { rows: payments } = await this.db.query(
+      "SELECT method,amount,tendered FROM payment WHERE company_id=$1 AND sale_id=$2",
+      [actor.company_id, saleId],
+    );
+    return { ...sale, items, payments };
+  }
+  async cancel(actor, key, saleId, raw) {
+    this.manager(actor);
+    id.parse(key);
+    id.parse(saleId);
+    const input = z
+      .strictObject({
+        expectedVersion: z.number().int().positive(),
+        reason: z.string().trim().min(5).max(240),
+      })
+      .parse(raw);
+    return this.db.write(
+      actor,
+      key,
+      { operation: "sale.cancel", saleId, ...input },
+      async (tx) => {
+        const {
+          rows: [sale],
+        } = await tx.query(
+          "UPDATE sale SET status='CANCELLED',cancelled_at=now(),cancelled_reason=$1,version=version+1 WHERE company_id=$2 AND id=$3 AND version=$4 AND status='COMPLETED' RETURNING id,status,version",
+          [input.reason, actor.company_id, saleId, input.expectedVersion],
+        );
+        ensure(
+          sale,
+          "VERSION_CONFLICT",
+          "Venda já cancelada, alterada ou não encontrada.",
+          409,
+        );
+        return sale;
+      },
+    );
+  }
+  async dashboard(actor, query) {
+    await this.module(actor, "DASHBOARD");
+    const p = this.period(query);
+    const args = [actor.company_id, p.from, p.to];
+    const {
+      rows: [summary],
+    } = await this.db.query(
+      `SELECT count(*) FILTER(WHERE status='COMPLETED')::int sales,COALESCE(sum(total) FILTER(WHERE status='COMPLETED'),0)::text revenue,COALESCE(sum(discount) FILTER(WHERE status='COMPLETED'),0)::text discounts,count(*) FILTER(WHERE status='CANCELLED')::int cancelled FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3`,
+      args,
+    );
+    const { rows: channels } = await this.db.query(
+      `SELECT channel,count(*)::int sales,sum(total)::text revenue FROM sale WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND status='COMPLETED' GROUP BY channel ORDER BY sum(total) DESC`,
+      args,
+    );
+    const { rows: products } = await this.db.query(
+      `SELECT i.name,i.unit,sum(i.quantity)::text quantity,sum(i.total)::text revenue FROM sale_item i JOIN sale s ON s.id=i.sale_id AND s.company_id=i.company_id WHERE s.company_id=$1 AND s.created_at>=$2 AND s.created_at<$3 AND s.status='COMPLETED' GROUP BY i.name,i.unit ORDER BY sum(i.total) DESC LIMIT 10`,
+      args,
+    );
+    return { summary, channels, products };
+  }
+  async audit(actor, query) {
+    await this.module(actor, "AUDIT");
+    const p = this.period(query);
+    const cursor = query.cursor
+      ? z
+          .string()
+          .regex(/^[1-9]\d{0,18}$/)
+          .parse(query.cursor)
+      : null;
+    const table = query.table
+      ? z
+          .enum([
+            "company",
+            "app_user",
+            "product",
+            "sale",
+            "sale_item",
+            "payment",
+            "invitation",
+          ])
+          .parse(query.table)
+      : null;
+    const { rows } = await this.db.query(
+      "SELECT * FROM audit WHERE company_id=$1 AND created_at>=$2 AND created_at<$3 AND ($4::bigint IS NULL OR id<$4) AND ($5::text IS NULL OR table_name=$5) ORDER BY id DESC LIMIT 51",
+      [actor.company_id, p.from, p.to, cursor, table],
+    );
+    return {
+      items: rows.slice(0, 50),
+      nextCursor: rows.length > 50 ? rows[49].id : null,
+    };
+  }
+  async users(actor) {
+    this.manager(actor);
+    const { rows } = await this.db.query(
+      "SELECT * FROM app_user WHERE company_id=$1 ORDER BY name LIMIT 100",
+      [actor.company_id],
+    );
+    return { items: rows.map(userDto) };
+  }
+  async invite(actor, raw, userId) {
+    this.manager(actor);
+    ensure(
+      this.config.emailKey && this.config.panel,
+      "EMAIL_NOT_CONFIGURED",
+      "Configure o envio de e-mails antes de convidar funcionários.",
+      503,
+    );
+    await this.db.rate("invite:" + actor.company_id, 30, 3600);
+    const token = secret(),
+      tokenHash = hash(token);
+    const input = userId
+      ? null
+      : z
+          .strictObject({
+            name: z.string().trim().min(1).max(80),
+            email,
+            role: z.enum(["MANAGER", "CASHIER"]),
+            shared_account: z.boolean().default(false),
+          })
+          .parse(raw);
+    if (userId) id.parse(userId);
+    const result = await this.db.transaction(actor, async (tx) => {
+      let user;
+      if (!userId) {
+        const {
+          rows: [n],
+        } = await tx.query(
+          "SELECT count(*)::int count FROM app_user WHERE company_id=$1",
+          [actor.company_id],
+        );
+        ensure(
+          n.count < 100,
+          "STAFF_LIMIT",
+          "Limite de 100 funcionários.",
+          409,
+        );
+        const {
+          rows: [u],
+        } = await tx.query(
+          "INSERT INTO app_user(id,company_id,name,email,role,shared_account) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",
+          [
+            randomUUID(),
+            actor.company_id,
+            input.name,
+            input.email,
+            input.role,
+            input.shared_account,
+          ],
+        );
+        user = u;
+      } else {
+        const {
+          rows: [u],
+        } = await tx.query(
+          "SELECT * FROM app_user WHERE id=$1 AND company_id=$2",
+          [userId, actor.company_id],
+        );
+        ensure(
+          u?.enabled && !u.password_hash,
+          "INVITE_UNAVAILABLE",
+          "Convite disponível somente para cadastro pendente e ativo.",
+          409,
+        );
+        user = u;
+      }
+      await tx.query(
+        "UPDATE invitation SET consumed_at=now() WHERE company_id=$1 AND user_id=$2 AND consumed_at IS NULL",
+        [actor.company_id, user.id],
+      );
+      await tx.query(
+        "INSERT INTO invitation(id,company_id,user_id,token_hash,purpose,expires_at) VALUES($1,$2,$3,$4,'INVITE',now()+interval '24 hours')",
+        [randomUUID(), actor.company_id, user.id, tokenHash],
+      );
+      return { id: user.id, email: user.email };
+    });
+    try {
+      await this.mail(
+        result.email,
+        this.config.panel + "/acesso#" + token,
+        "INVITE",
+      );
+      return { id: result.id, emailSent: true };
+    } catch {
+      return {
+        id: result.id,
+        emailSent: false,
+        message:
+          "Cadastro pendente criado. Falha no envio; use Reenviar convite.",
+      };
+    }
+  }
+  async user(actor, userId, raw) {
+    this.manager(actor);
+    id.parse(userId);
+    const input = z
+      .strictObject({
+        enabled: z.boolean(),
+        expectedVersion: z.number().int().positive(),
+      })
+      .parse(raw);
+    ensure(
+      userId !== actor.id,
+      "SELF_DISABLE",
+      "Você não pode desativar seu próprio acesso.",
+    );
+    return this.db.transaction(actor, async (tx) => {
+      const {
+        rows: [u],
+      } = await tx.query(
+        "UPDATE app_user SET enabled=$1,version=version+1 WHERE company_id=$2 AND id=$3 AND version=$4 RETURNING id",
+        [input.enabled, actor.company_id, userId, input.expectedVersion],
+      );
+      ensure(
+        u,
+        "VERSION_CONFLICT",
+        "Funcionário alterado ou não encontrado.",
+        409,
+      );
+      await tx.query("DELETE FROM session WHERE company_id=$1 AND user_id=$2", [
+        actor.company_id,
+        userId,
+      ]);
+      return u;
+    });
+  }
+  async requestReset(raw) {
+    const input = z
+      .strictObject({ slug: z.string().max(60), email })
+      .parse(raw);
+    ensure(
+      this.config.emailKey && this.config.panel,
+      "EMAIL_NOT_CONFIGURED",
+      "Redefinição por e-mail indisponível. Procure o responsável pelo sistema.",
+      503,
+    );
+    await this.db.rate("reset:" + input.slug + ":" + input.email, 3, 3600);
+    const {
+      rows: [u],
+    } = await this.db.query(
+      "SELECT u.* FROM app_user u JOIN company c ON c.id=u.company_id WHERE c.slug=$1 AND u.email=$2 AND u.enabled AND u.password_hash IS NOT NULL",
+      [input.slug, input.email],
+    );
+    if (u) {
+      const token = secret();
+      await this.db.transaction(
+        { company_id: u.company_id, request_id: randomUUID() },
+        async (tx) => {
+          await tx.query(
+            "UPDATE invitation SET consumed_at=now() WHERE user_id=$1 AND company_id=$2 AND purpose='RESET' AND consumed_at IS NULL",
+            [u.id, u.company_id],
+          );
+          await tx.query(
+            "INSERT INTO invitation(id,company_id,user_id,token_hash,purpose,expires_at) VALUES($1,$2,$3,$4,'RESET',now()+interval '30 minutes')",
+            [randomUUID(), u.company_id, u.id, hash(token)],
+          );
+        },
+      );
+      await this.mail(
+        u.email,
+        this.config.panel + "/acesso#" + token,
+        "RESET",
+      ).catch(() => {});
+    }
+    return { accepted: true };
+  }
+  async complete(raw) {
+    const input = z
+      .strictObject({
+        token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+        password,
+        name: z.string().trim().min(1).max(80).optional(),
+      })
+      .parse(raw);
+    const {
+      rows: [link],
+    } = await this.db.query(
+      "SELECT i.*,u.name,u.enabled,u.role,u.shared_account FROM invitation i JOIN app_user u ON u.id=i.user_id AND u.company_id=i.company_id WHERE token_hash=$1",
+      [hash(input.token)],
+    );
+    ensure(
+      link?.enabled && link.expires_at > new Date() && !link.consumed_at,
+      "INVALID_LINK",
+      "Link inválido ou expirado.",
+    );
+    const passwordHash = await hashPassword(input.password);
+    return this.db.transaction(
+      {
+        company_id: link.company_id,
+        id: link.user_id,
+        name: link.name,
+        role: link.role,
+        shared_account: link.shared_account,
+      },
+      async (tx) => {
+        const {
+          rows: [current],
+        } = await tx.query(
+          "SELECT i.*,u.enabled FROM invitation i JOIN app_user u ON u.id=i.user_id AND u.company_id=i.company_id WHERE i.id=$1 AND i.consumed_at IS NULL AND i.expires_at>now() FOR UPDATE",
+          [link.id],
+        );
+        ensure(current?.enabled, "INVALID_LINK", "Link inválido ou expirado.");
+        await tx.query(
+          "UPDATE app_user SET password_hash=$1,name=COALESCE($2,name),version=version+1 WHERE id=$3 AND company_id=$4",
+          [passwordHash, input.name, link.user_id, link.company_id],
+        );
+        await tx.query(
+          "UPDATE invitation SET consumed_at=now() WHERE user_id=$1 AND company_id=$2 AND consumed_at IS NULL",
+          [link.user_id, link.company_id],
+        );
+        await tx.query(
+          "DELETE FROM session WHERE user_id=$1 AND company_id=$2",
+          [link.user_id, link.company_id],
+        );
+        return { completed: true };
+      },
+    );
+  }
 }

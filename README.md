@@ -38,21 +38,21 @@ API em http://localhost:3001/v1. O seed exige SEED_MANAGER_EMAIL e senha de 12�
 
 Crie um Web Service Node, branch main. Use banco PostgreSQL novo para este produto/cliente; não reaproveite Bonamassa.
 
-| Campo | Valor |
-|---|---|
-| Build Command | npm ci && npm run build |
-| Start Command | npm run start:deploy |
-| Health Check Path | /v1/health |
-| NODE_VERSION | 24 |
-| NODE_ENV | production |
-| DATABASE_URL | Conexão do banco novo, senha codificada na URL, TLS sslmode=verify-full |
-| CORS_ORIGINS | URL exata do ERPFront, sem barra final |
-| PANEL_URL | URL exata do ERPFront, sem barra final |
-| LICENSE_MODULES | DASHBOARD,AUDIT (ou apenas os módulos contratados; vazio libera somente a base) |
-| SEED_COMPANY_SLUG | Identificador único, por exemplo padaria-exemplo |
-| SEED_COMPANY_NAME | Nome inicial do cliente |
-| SEED_MANAGER_EMAIL | E-mail do primeiro gerente |
-| SEED_MANAGER_PASSWORD | Senha inicial exclusiva, 12–128 caracteres |
+| Campo                 | Valor                                                                           |
+| --------------------- | ------------------------------------------------------------------------------- |
+| Build Command         | npm ci && npm run build                                                         |
+| Start Command         | npm run start:deploy                                                            |
+| Health Check Path     | /v1/health                                                                      |
+| NODE_VERSION          | 24                                                                              |
+| NODE_ENV              | production                                                                      |
+| DATABASE_URL          | Conexão do banco novo, senha codificada na URL, TLS sslmode=verify-full         |
+| CORS_ORIGINS          | URL exata do ERPFront, sem barra final                                          |
+| PANEL_URL             | URL exata do ERPFront, sem barra final                                          |
+| LICENSE_MODULES       | DASHBOARD,AUDIT (ou apenas os módulos contratados; vazio libera somente a base) |
+| SEED_COMPANY_SLUG     | Identificador único, por exemplo padaria-exemplo                                |
+| SEED_COMPANY_NAME     | Nome inicial do cliente                                                         |
+| SEED_MANAGER_EMAIL    | E-mail do primeiro gerente                                                      |
+| SEED_MANAGER_PASSWORD | Senha inicial exclusiva, 12–128 caracteres                                      |
 
 start:deploy aplica migrations pendentes com lock e checksum e executa o seed idempotente antes de iniciar. Alterar SQL de migration já aplicada é recusado. Credenciais ficam no Render, não precisam de arquivo .env no servidor. render.yaml fornece um Blueprint de teste, plano free; dimensionamento e backups precisam de revisão antes de produção comercial.
 
